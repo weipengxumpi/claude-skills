@@ -1,6 +1,6 @@
 ---
 name: eval-training
-description: Generate the livedealer_infer.py evaluation command for a Wan2.2-S2V training run (e.g. leo_114.sh, or a SLURM job id). Reads the training script and emits the inference snippet on the eyes-only test set, mirroring the canonical evals in live_dealer/infer/infer_card_class.sh — correct WAN_* env flags, lora_path/step, width/height, and pose/object inputs. Use when the user says "evaluate this training job", "make the infer command for run X", "eval job 43983676", or "generate the eval snippet".
+description: Generate the livedealer_infer.py evaluation command for a Wan2.2-S2V training run (e.g. leo_114.sh, a SLURM job id, or a checkpoint path like outputs/<run>/step-600.safetensors). Reads the training script and emits the inference snippet on the eyes-only test set, mirroring the canonical evals in live_dealer/infer/infer_card_class.sh — correct WAN_* env flags, lora_path/step, width/height, and pose/object inputs. Use when the user says "evaluate this training job", "make the infer command for run X", "eval job 43983676", "eval this checkpoint", or "generate the eval snippet".
 ---
 
 # Generate an evaluation snippet for a training run
@@ -27,12 +27,35 @@ prefixed with `HF_HUB_OFFLINE=1`.
 
 ```bash
 python3 .claude/skills/eval-training/eval_snippet.py \
-  ( --base <path/to/training_leo_N.sh> | --job-id <SLURM_JOB_ID> ) \
-  [--step <STEP>]   # default: latest checkpoint \
+  ( --base <path/to/training_leo_N.sh> | --job-id <SLURM_JOB_ID> | --checkpoint <outputs/<run>/step-N.safetensors> ) \
+  [--step <STEP>]   # default: latest checkpoint (ignored with --checkpoint) \
   [--distill[=T0,T1,...]]  # distillation model: denoise in a few fixed steps \
   [--append]        # also append the snippet to infer_card_class.sh \
   [--launch]        # also run the eval on a GPU node (srun + singularity)
 ```
+
+## Three ways to identify the run
+
+Provide **one** of:
+
+- `--base <training_leo_N.sh>` — read the script directly; run name = basename of
+  `--output_path`, step = latest checkpoint (or `--step`).
+- `--job-id <SLURM_JOB_ID>` — resolve the training script from the job (see below).
+- `--checkpoint <PATH>` — point straight at a `step-<N>.safetensors`. The **run name
+  and step are derived from the path**, so the checkpoint dir need not match any
+  training script's `--output_path` (the common case for checkpoints copied in from
+  another machine, e.g. `outputs/b200_card_class_embed_121/step-600.safetensors`).
+
+`--checkpoint` still needs the training **config** (WAN_* flags, resolution,
+extra_inputs gating). Supply it either way:
+
+- **Combine with `--base`/`--job-id`** — pulls the config from that script but takes
+  the run/step from the checkpoint path. Best when a matching training script exists
+  but its `--output_path` differs from the checkpoint dir.
+- **Set it explicitly** — `--wan-env WAN_CARD_CLASS_EMBED=true` (repeatable, or one
+  comma/space-separated string), `--extra-inputs input_image,input_audio,s2v_pose_video,card_detection`,
+  `--width`, `--height`. With no source for a field the helper warns and defaults
+  (no WAN_* flags; `--extra_inputs` = `input_image,input_audio,s2v_pose_video,s2v_object_video`).
 
 ## Distillation models (`--distill`)
 
@@ -47,6 +70,24 @@ log with `-distill` so it doesn't clobber a regular eval of the same checkpoint.
 `livedealer_infer.py` accepts `--custom_timesteps T0,T1,...` directly and forwards
 it to the pipeline's `custom_timesteps` (see `__call__`); `--distill` is just the
 convenience wrapper that fills in the canonical schedule.
+
+### Frozen extra modules (`--extra_module_ckpt_path`) — avoids all-black video
+
+A `--task direct_distill` run freezes non-LoRA modules like `card_encoder` and does
+**not** save them in its checkpoint (the checkpoint is LoRA-only). `card_encoder` is
+created at inference via `.to_empty()` (uninitialized memory); if nothing fills it,
+`model_fn` runs the object/card latents through garbage weights → NaN → **all-black**
+output (independent of the denoising schedule). To fix this, the helper auto-emits
+`--extra_module_ckpt_path <base>` whenever the training script has `--task
+direct_distill` (or you pass `--distill`), pointing at the base checkpoint the run
+resumed from (its `--lora_checkpoint`, converted from the `/output/...` container path
+to the host-relative `outputs/...`). `livedealer_infer.py` then loads only the
+**non-LoRA** tensors (e.g. `card_encoder.weight/bias`) from that base, leaving the
+distill LoRA (which is cumulative — it continued the base LoRA) untouched.
+
+If a distill run resumed from a base that itself lacks the extra module, or the
+auto-derived path is wrong, override or drop `--extra_module_ckpt_path` in the
+printed snippet.
 
 Pass **either** `--base` (the training script directly) **or** `--job-id` (a SLURM
 job id). With `--job-id` the helper resolves the training script automatically:
@@ -90,9 +131,12 @@ python3 .claude/skills/eval-training/eval_snippet.py --job-id 44063494 --launch
 ## Procedure for the agent
 
 1. Identify the training run. If the user gives a SLURM job id (e.g. "eval job
-   43983676"), pass `--job-id`. Otherwise identify the training script (the most
-   recently opened `*_leo_<N>.sh` is a strong default; or match the run name to a
-   script's `--output_path`) and pass `--base`.
+   43983676"), pass `--job-id`. If they name/point at a checkpoint file (e.g. "eval
+   this step-600" or `outputs/<run>/step-600.safetensors`), pass `--checkpoint` —
+   and if a matching training script exists, also pass `--base` for its config (run
+   name + step still come from the checkpoint path). Otherwise identify the training
+   script (the most recently opened `*_leo_<N>.sh` is a strong default; or match the
+   run name to a script's `--output_path`) and pass `--base`.
 2. Run the helper and present the generated snippet (and which step it used).
 3. If the user wants it saved, re-run with `--append` or add it where they prefer.
 4. If the user wants it **run**, re-run with `--launch` (in the background) and

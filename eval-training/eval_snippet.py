@@ -34,6 +34,7 @@ import sys
 
 TEST_SET = "data/project21_snapshot_12032025_packed/test_set"
 SLURM_LOGS_DIR = "/leonardo_scratch/large/userexternal/{user}/slurm_logs"
+DEFAULT_EXTRA = "input_image,input_audio,s2v_pose_video,s2v_object_video"
 
 # Canonical denoising schedule for distillation-model evals, matching
 # direct_distill_loss() in diffsynth/pipelines/wan_video_new.py.
@@ -189,11 +190,28 @@ def launch(snippet, run, step, args, tag=""):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    src = ap.add_mutually_exclusive_group(required=True)
+    src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--base", help="path to training *_leo_<N>.sh")
     src.add_argument("--job-id", help="SLURM job id; resolves the training script "
                                       "via scontrol, then the job's slurm log")
-    ap.add_argument("--step", type=int, default=None, help="checkpoint step (default: latest)")
+    ap.add_argument("--checkpoint", "--lora", dest="checkpoint", default=None,
+                    metavar="PATH",
+                    help="evaluate a checkpoint path directly (e.g. "
+                         "outputs/<run>/step-<N>.safetensors). The run name and step are "
+                         "derived from the path, so the checkpoint dir need not match any "
+                         "training script's --output_path. Combine with --base/--job-id to "
+                         "pull the training config (WAN_* flags, resolution, extra_inputs), "
+                         "or pass --wan-env/--extra-inputs/--width/--height to set it explicitly.")
+    ap.add_argument("--wan-env", action="append", default=None, metavar="WAN_X=Y",
+                    help="WAN_* env assignment(s) for inference; repeatable, or one "
+                         "space/comma-separated string. Overrides those derived from --base.")
+    ap.add_argument("--extra-inputs", dest="extra_inputs", default=None,
+                    help="override the trained --extra_inputs gating "
+                         "(e.g. 'input_image,input_audio,s2v_pose_video,card_detection')")
+    ap.add_argument("--width", default=None, help="override inference width")
+    ap.add_argument("--height", default=None, help="override inference height")
+    ap.add_argument("--step", type=int, default=None, help="checkpoint step (default: latest); "
+                    "ignored when --checkpoint is given (step comes from the path)")
     ap.add_argument("--outputs-dir", default=None)
     ap.add_argument("--slurm-logs-dir", default=SLURM_LOGS_DIR,
                     help="slurm log dir template ({user} expands to $USER) for --job-id")
@@ -219,27 +237,82 @@ def main():
     ap.add_argument("--mem", default=LAUNCH["mem"])
     args = ap.parse_args()
 
+    if not (args.base or args.job_id or args.checkpoint):
+        ap.error("provide --checkpoint, --base, or --job-id")
+
+    # Config source (training script): optional when --checkpoint is given and the
+    # config is supplied via --wan-env / --extra-inputs / --width / --height.
     base = args.base
     if args.job_id:
         base = resolve_base_from_jobid(args.job_id, args.slurm_logs_dir)
         print(f"# job {args.job_id} -> {base}", file=sys.stderr)
-    if not os.path.isfile(base):
-        fail(f"training script not found: {base}")
-    text = open(base).read()
+    text = None
+    if base:
+        if not os.path.isfile(base):
+            fail(f"training script not found: {base}")
+        text = open(base).read()
 
-    out_path = arg_value(text, "output_path")
-    if not out_path:
-        fail("no --output_path in training script")
-    run = os.path.basename(out_path.rstrip("/"))
+    # Run name + step + lora_path.
+    all_steps = None
+    if args.checkpoint:
+        ckpt = args.checkpoint
+        m = re.search(r"step-(\d+)\.safetensors$", os.path.basename(ckpt))
+        if not m:
+            fail(f"--checkpoint must point at a step-<N>.safetensors file: {ckpt}")
+        step = int(m.group(1))
+        run = os.path.basename(os.path.dirname(ckpt.rstrip("/")))
+        if not run:
+            fail(f"could not derive a run name from --checkpoint parent dir: {ckpt}")
+        check = ckpt if os.path.isabs(ckpt) else os.path.join(args.workspace or os.getcwd(), ckpt)
+        if not os.path.isfile(check):
+            fail(f"checkpoint not found: {check}")
+        lora_path = ckpt
+    else:
+        out_path = arg_value(text, "output_path")
+        if not out_path:
+            fail("no --output_path in training script")
+        run = os.path.basename(out_path.rstrip("/"))
+        step, all_steps = pick_step(
+            os.path.join(host_outputs(text, args.outputs_dir), run), args.step)
+        lora_path = f"outputs/{run}/step-{step}.safetensors"
 
-    step, all_steps = pick_step(os.path.join(host_outputs(text, args.outputs_dir), run), args.step)
-    extra = arg_value(text, "extra_inputs") or "input_image,input_audio,s2v_pose_video,s2v_object_video"
-    width, height = arg_value(text, "width"), arg_value(text, "height")
-    flags = wan_flags(text)
+    # Config: explicit overrides win, then the training script, then defaults.
+    if args.extra_inputs is not None:
+        extra = args.extra_inputs
+    elif text is not None:
+        extra = arg_value(text, "extra_inputs") or DEFAULT_EXTRA
+    else:
+        extra = DEFAULT_EXTRA
+        print("# WARN: no --base/--extra-inputs; defaulting --extra_inputs gating to "
+              f"'{DEFAULT_EXTRA}'", file=sys.stderr)
+    width = args.width if args.width is not None else (arg_value(text, "width") if text else None)
+    height = args.height if args.height is not None else (arg_value(text, "height") if text else None)
+    if args.wan_env:
+        flags = [f for item in args.wan_env for f in re.split(r"[,\s]+", item.strip()) if f]
+    elif text is not None:
+        flags = wan_flags(text)
+    else:
+        flags = []
+        print("# WARN: no --base/--wan-env; emitting no WAN_* flags", file=sys.stderr)
+
+    # Distillation runs (`--task direct_distill`) freeze extra modules like
+    # card_encoder and DON'T save them in the checkpoint (only the LoRA). At
+    # inference card_encoder is created via .to_empty() and, left unloaded, NaNs
+    # the forward pass -> all-black video. Load those frozen modules from the base
+    # checkpoint the run resumed from (its --lora_checkpoint), converting the
+    # container path (/output/<base>/...) to the host/workspace-relative form
+    # (outputs/<base>/...) that inference uses.
+    is_distill = bool(args.distill) or (text is not None and "direct_distill" in (arg_value(text, "task") or ""))
+    lora_ckpt = arg_value(text, "lora_checkpoint") if text else None
+    extra_module_ckpt = None
+    if is_distill and lora_ckpt:
+        extra_module_ckpt = re.sub(r"^/?output/", "outputs/", lora_ckpt)
 
     env = " ".join(["HF_HUB_OFFLINE=1", *flags])
     lines = [f"{env} python live_dealer/infer/livedealer_infer.py \\",
-             f"  --lora_path outputs/{run}/step-{step}.safetensors \\"]
+             f"  --lora_path {lora_path} \\"]
+    if extra_module_ckpt:
+        lines.append(f"  --extra_module_ckpt_path {extra_module_ckpt} \\")
     if "s2v_pose_video" in extra:
         lines.append(f"  --pose_video {LISTS['pose_video']} \\")
     if "s2v_object_video" in extra:
@@ -269,8 +342,9 @@ def main():
     lines.append("  --use_block_attn")
     snippet = "\n".join(lines)
 
-    print(f"# checkpoints in {run}: {', '.join(f'step-{s}' for s in all_steps)}", file=sys.stderr)
-    print(f"# evaluating step-{step}\n", file=sys.stderr)
+    if all_steps:
+        print(f"# checkpoints in {run}: {', '.join(f'step-{s}' for s in all_steps)}", file=sys.stderr)
+    print(f"# evaluating {run} step-{step}\n", file=sys.stderr)
     print(snippet)
 
     if args.append:
