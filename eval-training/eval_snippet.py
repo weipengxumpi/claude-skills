@@ -33,7 +33,16 @@ import subprocess
 import sys
 
 TEST_SET = "data/project21_snapshot_12032025_packed/test_set"
+DATA_ROOT = os.path.dirname(TEST_SET)  # base dir the data/ symlink points into
 SLURM_LOGS_DIR = "/leonardo_scratch/large/userexternal/{user}/slurm_logs"
+
+# Canonical 100-sample eyes-only metadata CSVs (see --csv). The pipeline reads the
+# `card_detection` column only when present, so card-detection models (card_detection
+# in --extra_inputs / WAN_CARD_CLASS_EMBED) want the one WITH that column, while
+# card-encoder models (s2v_object_video, no card_detection) want the no_carddet one.
+CSV_CARDDET = f"{TEST_SET}/metadata_12032025_v2_shape_S2VObject_new_eyes_only_leo_cards_sample100.csv"
+CSV_NO_CARDDET = f"{TEST_SET}/metadata_12032025_v2_shape_S2VObject_new_eyes_only_sample100_no_carddet.csv"
+AUTO_CSV = "auto"  # sentinel for bare `--csv` (pick CARDDET vs NO_CARDDET from config)
 DEFAULT_EXTRA = "input_image,input_audio,s2v_pose_video,s2v_object_video"
 
 # Canonical denoising schedule for distillation-model evals, matching
@@ -146,6 +155,34 @@ def wan_flags(text):
     return re.findall(r"\bWAN_[A-Z0-9_]+=\S+", m.group(1))
 
 
+def workspace_rel(path, workspace):
+    """Rewrite an absolute CSV/data path to its workspace-relative form via the
+    data/ symlink, so the snippet follows infer_card_class.sh's convention and
+    resolves inside the container (which runs from /workspace). Relative paths
+    pass through unchanged; paths outside the data/ tree warn and pass through."""
+    if not os.path.isabs(path):
+        return path
+    data_real = os.path.realpath(os.path.join(workspace, DATA_ROOT))
+    p = os.path.realpath(path)
+    if p == data_real or p.startswith(data_real + os.sep):
+        return os.path.join(DATA_ROOT, os.path.relpath(p, data_real))
+    print(f"# WARN: {path} is not under {DATA_ROOT}; using the path as given "
+          "(ensure it is bind-mounted in the container)", file=sys.stderr)
+    return path
+
+
+def csv_tag(csv):
+    """A compact save_path/log suffix distinguishing a CSV eval from a list-file
+    eval (and one CSV from another), e.g. 'sample100'."""
+    stem = os.path.splitext(os.path.basename(csv))[0]
+    # `sampleN` plus any trailing descriptors (e.g. `sample100_no_carddet`), so the
+    # card-detection and no_carddet CSVs don't collide on the same save_path.
+    m = re.search(r"sample\d+(?:_\w+)*", stem)
+    if m:
+        return m.group(0)
+    return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:24] or "csv"
+
+
 def launch(snippet, run, step, args, tag=""):
     """Run the snippet on a GPU node via srun + singularity exec --nv.
 
@@ -208,6 +245,23 @@ def main():
     ap.add_argument("--extra-inputs", dest="extra_inputs", default=None,
                     help="override the trained --extra_inputs gating "
                          "(e.g. 'input_image,input_audio,s2v_pose_video,card_detection')")
+    ap.add_argument("--csv", "--dataset-metadata", dest="csv", nargs="?", const=AUTO_CSV,
+                    default=None, metavar="PATH",
+                    help="evaluate on a metadata CSV (--dataset_metadata_path) instead of the "
+                         "hard-coded eyes-only list files. Bare --csv auto-picks the canonical "
+                         "100-sample CSV from the config: the card-detection CSV when card_detection "
+                         "is in --extra_inputs, else the no_carddet CSV (card-encoder models). Pass "
+                         "an explicit PATH to force a specific CSV. Expected columns: video, "
+                         "input_audio, s2v_pose_video, s2v_object_video, input_image[, card_detection]. "
+                         "The CSV carries every per-input list, so the pose/object/card_detection "
+                         "gating is bypassed (the pipeline uses what its WAN_* config needs). Absolute "
+                         "paths under the data/ symlink are rewritten workspace-relative. Combine with "
+                         "--base/--job-id/--checkpoint for the training config (WAN_* flags, resolution).")
+    ap.add_argument("--dataset-base-path", dest="dataset_base_path", default=None, metavar="DIR",
+                    help=f"base dir prepended to CSV-relative paths (default: {DATA_ROOT})")
+    ap.add_argument("--save-tag", dest="save_tag", default=None,
+                    help="override the auto-derived save_path/log suffix used in CSV mode "
+                         "(default: a slug from the CSV filename, e.g. 'sample100')")
     ap.add_argument("--width", default=None, help="override inference width")
     ap.add_argument("--height", default=None, help="override inference height")
     ap.add_argument("--step", type=int, default=None, help="checkpoint step (default: latest); "
@@ -308,24 +362,52 @@ def main():
     if is_distill and lora_ckpt:
         extra_module_ckpt = re.sub(r"^/?output/", "outputs/", lora_ckpt)
 
+    # Resolve which CSV to evaluate on (if any): bare --csv auto-picks from the
+    # config (card_detection in --extra_inputs -> card-detection CSV, else the
+    # no_carddet CSV for card-encoder models); an explicit --csv PATH forces one.
+    csv_src = None
+    if args.csv is not None:
+        if args.csv == AUTO_CSV:
+            needs_carddet = "card_detection" in extra
+            csv_src = CSV_CARDDET if needs_carddet else CSV_NO_CARDDET
+            print(f"# auto-selected {'card-detection' if needs_carddet else 'no-card-detection'} "
+                  f"CSV ({'card_detection in --extra_inputs' if needs_carddet else 'card-encoder model'}): "
+                  f"{csv_src}", file=sys.stderr)
+        else:
+            csv_src = args.csv
+        csv_abs = csv_src if os.path.isabs(csv_src) else os.path.join(args.workspace or os.getcwd(), csv_src)
+        if not os.path.isfile(csv_abs):
+            fail(f"CSV not found: {csv_abs}")
+
     env = " ".join(["HF_HUB_OFFLINE=1", *flags])
     lines = [f"{env} python live_dealer/infer/livedealer_infer.py \\",
              f"  --lora_path {lora_path} \\"]
     if extra_module_ckpt:
         lines.append(f"  --extra_module_ckpt_path {extra_module_ckpt} \\")
-    if "s2v_pose_video" in extra:
-        lines.append(f"  --pose_video {LISTS['pose_video']} \\")
-    if "s2v_object_video" in extra:
-        lines.append(f"  --object_video {LISTS['object_video']} \\")
-    # WAN_CARD_CLASS_EMBED runs feed raw (x, y, class) detections instead of a
-    # rendered object video; the WAN_CARD_CLASS_EMBED=true flag is already carried
-    # over by wan_flags(), and livedealer_infer.py ignores object_video in this mode.
-    if "card_detection" in extra:
-        lines.append(f"  --card_detection {LISTS['card_detection']} \\")
-    lines.append(f"  --input_image {LISTS['input_image']} \\")
-    lines.append(f"  --audio_path {LISTS['audio_path']} \\")
-    lines.append(f"  --gt_path {LISTS['gt_path']} \\")
+    if csv_src:
+        # The CSV carries every per-input column; livedealer_infer.py builds all
+        # lists from it (pose/object/gt/input_image/audio/card_detection) and the
+        # pipeline uses whichever its WAN_* config needs, so the extra_inputs
+        # gating that selects list flags is irrelevant here.
+        csv_path = workspace_rel(csv_src, args.workspace or os.getcwd())
+        lines.append(f"  --dataset_metadata_path {csv_path} \\")
+        lines.append(f"  --dataset_base_path {args.dataset_base_path or DATA_ROOT} \\")
+    else:
+        if "s2v_pose_video" in extra:
+            lines.append(f"  --pose_video {LISTS['pose_video']} \\")
+        if "s2v_object_video" in extra:
+            lines.append(f"  --object_video {LISTS['object_video']} \\")
+        # WAN_CARD_CLASS_EMBED runs feed raw (x, y, class) detections instead of a
+        # rendered object video; the WAN_CARD_CLASS_EMBED=true flag is already carried
+        # over by wan_flags(), and livedealer_infer.py ignores object_video in this mode.
+        if "card_detection" in extra:
+            lines.append(f"  --card_detection {LISTS['card_detection']} \\")
+        lines.append(f"  --input_image {LISTS['input_image']} \\")
+        lines.append(f"  --audio_path {LISTS['audio_path']} \\")
+        lines.append(f"  --gt_path {LISTS['gt_path']} \\")
     save_suffix = "-distill" if args.distill else ""
+    if csv_src:
+        save_suffix += "-" + (args.save_tag or csv_tag(csv_src))
     lines.append(f"  --save_path output/{run}-{step}{save_suffix} \\")
     lines.append("  --infer_frames 12 \\")
     lines.append("  --num_clips 1 \\")

@@ -29,10 +29,43 @@ prefixed with `HF_HUB_OFFLINE=1`.
 python3 .claude/skills/eval-training/eval_snippet.py \
   ( --base <path/to/training_leo_N.sh> | --job-id <SLURM_JOB_ID> | --checkpoint <outputs/<run>/step-N.safetensors> ) \
   [--step <STEP>]   # default: latest checkpoint (ignored with --checkpoint) \
+  [--csv [metadata.csv]]   # evaluate on a metadata CSV (bare --csv auto-picks) instead of the lists \
   [--distill[=T0,T1,...]]  # distillation model: denoise in a few fixed steps \
   [--append]        # also append the snippet to infer_card_class.sh \
   [--launch]        # also run the eval on a GPU node (srun + singularity)
 ```
+
+## CSV test set (`--csv`)
+
+By default the snippet evaluates on the hard-coded eyes-only list files. Pass
+`--csv` to evaluate on a metadata CSV instead — the helper emits
+`--dataset_metadata_path <csv> --dataset_base_path <DIR>` (both natively supported
+by `livedealer_infer.py`) in place of the per-input `--pose_video` /
+`--object_video` / `--input_image` / `--audio_path` / `--gt_path` /
+`--card_detection` list flags.
+
+- **Bare `--csv` auto-picks** the canonical 100-sample eyes-only CSV from the config:
+  - card-detection models (`card_detection` in `--extra_inputs`, e.g.
+    `WAN_CARD_CLASS_EMBED`) → `..._leo_cards_sample100.csv` (has the `card_detection`
+    column);
+  - card-encoder models (use `s2v_object_video`, no card detection) →
+    `..._sample100_no_carddet.csv`.
+  - Pass an explicit `--csv <metadata.csv>` to force a specific file.
+
+- Expected CSV columns: `video, input_audio, s2v_pose_video, s2v_object_video,
+  input_image, card_detection`. The CSV carries **every** per-input list, so the
+  `--extra_inputs` pose/object/card gating is bypassed — the pipeline uses whichever
+  inputs its WAN_* config needs.
+- `--csv` is **not** a run identifier; combine it with `--base`/`--job-id`/`--checkpoint`
+  for the training config (WAN_* flags, resolution).
+- An **absolute** CSV path under the `data/` symlink is rewritten workspace-relative
+  (e.g. `/leonardo_work/.../shared/livedealer/test_set/foo.csv` →
+  `data/project21_snapshot_12032025_packed/test_set/foo.csv`). `--dataset-base-path`
+  defaults to `data/project21_snapshot_12032025_packed`; override if the CSV's
+  relative paths resolve against a different root.
+- The save path / log gets a tag derived from the CSV filename (e.g. `-sample100`)
+  so a CSV eval doesn't clobber a list-file eval of the same checkpoint. Override
+  with `--save-tag`.
 
 ## Three ways to identify the run
 
