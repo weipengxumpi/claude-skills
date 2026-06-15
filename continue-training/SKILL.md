@@ -11,14 +11,21 @@ following the project convention used across `live_dealer/train/*_leo_<N>.sh`.
 ## What a continuation script changes (vs. the base script)
 
 Everything is preserved except the launch args:
-- `--output_path` gets a `_cont<STEP>_SF<SF>` suffix (a **new** run dir; the source run's
+- `--output_path` gets a `_cont<TOTAL>_SF<SF>` suffix (a **new** run dir; the source run's
   checkpoints are never touched). A pre-existing `_cont…_SF…` suffix is stripped first so
   chained continuations don't grow unbounded.
 - `--lora_checkpoint <run>/step-<STEP>.safetensors` is added/replaced.
 - `--skip_frames <SF>` is added/replaced.
-- `#SBATCH --job-name` becomes a concise `<run>_sf<SF>_cont<STEP>`.
+- `#SBATCH --job-name` becomes a concise `<run>_sf<SF>_cont<TOTAL>`.
 
-`<STEP>` defaults to the **latest** `step-*.safetensors` in the run's output dir.
+`<STEP>` defaults to the **latest** `step-*.safetensors` in the run's output dir — this is
+the actual checkpoint file the run resumes from.
+
+`<TOTAL>` is the **cumulative step count from the very first run**, not the last job's
+local step. A continuation run restarts its own step counter at 0, so `<TOTAL>` =
+the `_cont<N>` already encoded in the parent run name (0 if this is the first
+continuation) + the resume `<STEP>`. This keeps run-dir names monotonic across a chain
+of continuations (e.g. `_cont600_SF3` → resume its latest `step-400` → `_cont1000_SF3`).
 
 ## How to run it
 

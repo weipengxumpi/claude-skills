@@ -68,11 +68,12 @@ def next_script_path(base_path):
     return os.path.join(d, f"{prefix}{n}{ext}")
 
 
-def short_jobname(run_name, step, sf):
+def short_jobname(run_name, total_step, sf):
     # e.g. leo_new_eyes_only_16nodes_card_sequential_rope_compression -> "rope_compression"
+    # total_step is the cumulative step count from the first run (matches the run-dir suffix).
     tail = re.sub(r"_cont\d+_SF\d+$", "", run_name)
     tail = "_".join(tail.split("_")[-2:]) or tail
-    return f"{tail}_sf{sf}_cont{step}"[:64]
+    return f"{tail}_sf{sf}_cont{total_step}"[:64]
 
 
 def main():
@@ -111,16 +112,25 @@ def main():
         print(f"checkpoints in {run_name}: {', '.join(f'step-{s}' for s in all_steps)}")
         print(f"-> resuming from latest: step-{step}")
 
-    # New run name: strip any prior _cont/_SF suffix so chained continuations don't grow unbounded.
+    # Cumulative step count from the very first run. A continuation run restarts its own
+    # step counter at 0, so the latest checkpoint only reflects steps in *that* job. The
+    # parent run name already encodes the total accumulated up to its start in `_cont<N>`
+    # (0 if this is the first continuation); add the current checkpoint step to it.
+    m_prev = re.search(r"_cont(\d+)_SF\d+$", run_name)
+    prev_total = int(m_prev.group(1)) if m_prev else 0
+    total_step = prev_total + step
+
+    # New run name: strip any prior _cont/_SF suffix so chained continuations don't grow
+    # unbounded, and tag it with the cumulative step total (not the last job's local step).
     stripped = re.sub(r"_cont\d+_SF\d+$", "", run_name)
-    new_run = f"{stripped}_cont{step}_SF{args.sf}"
+    new_run = f"{stripped}_cont{total_step}_SF{args.sf}"
     new_output_path = f"{container_out_root}/{new_run}"
     ckpt_container = f"{container_out_root}/{run_name}/step-{step}.safetensors"
 
     new = text
     # 1) job-name
     new = re.sub(r"(#SBATCH --job-name=)\S+(.*)",
-                 lambda m: f"{m.group(1)}{short_jobname(run_name, step, args.sf)}"
+                 lambda m: f"{m.group(1)}{short_jobname(run_name, total_step, args.sf)}"
                            f"            # continue {run_name} @ step-{step}, skip_frames {args.sf}",
                  new, count=1)
     # 2) output_path
@@ -144,8 +154,10 @@ def main():
     os.chmod(out_path, 0o755)
 
     print(f"\nwrote: {out_path}")
-    print(f"  job-name   : {short_jobname(run_name, step, args.sf)}")
+    print(f"  job-name   : {short_jobname(run_name, total_step, args.sf)}")
     print(f"  resume from: {ckpt_container}")
+    if prev_total:
+        print(f"  cumulative : {prev_total} (parent) + {step} (this checkpoint) = {total_step} total steps")
     print(f"  new run    : {new_output_path}")
     print(f"  skip_frames: {args.sf}")
 
