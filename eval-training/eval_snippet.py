@@ -53,8 +53,11 @@ DISTILL_TIMESTEPS = "1000,768,358"
 # live_dealer/infer/infer_card_class.sh (srun + singularity exec --nv).
 WORK_DEFAULT = "/leonardo_work/AIFAC_F02_378"
 SIF_REL = "shared/singularity/diffsynth-a100/diffsynth-bind-a100.sif"
-LAUNCH = dict(account="aifac_f02_378", partition="boost_usr_prod",
+LAUNCH = dict(account="aifac_f02_493", partition="boost_usr_prod",
               qos="boost_qos_dbg", time="00:30:00", cpus="8", mem="64G")
+AUTO_QOS = "auto"      # sentinel for --qos: pick by sample count (see SAMPLE_QOS_THRESHOLD)
+SAMPLE_QOS_THRESHOLD = 10  # > this many samples -> non-preemptible `normal` QOS
+NORMAL_QOS_TIME = "02:00:00"  # default wall time when auto-bumped to `normal`
 LISTS = {
     "pose_video": f"{TEST_SET}/infer_list_shape_body_only_eye.txt",
     "object_video": f"{TEST_SET}/infer_list_shape_card_only.txt",
@@ -183,6 +186,20 @@ def csv_tag(csv):
     return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:24] or "csv"
 
 
+def count_test_samples(csv_abs, workspace):
+    """Number of test items the eval will run: CSV data rows (minus header), or
+    non-blank lines in the input_image list (the per-sample list, in list mode).
+    Returns None if it can't be determined (caller falls back to the dbg QOS)."""
+    try:
+        if csv_abs:
+            with open(csv_abs) as f:
+                return max(0, sum(1 for _ in f) - 1)
+        with open(os.path.join(workspace, LISTS["input_image"])) as f:
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return None
+
+
 def launch(snippet, run, step, args, tag=""):
     """Run the snippet on a GPU node via srun + singularity exec --nv.
 
@@ -285,7 +302,9 @@ def main():
     ap.add_argument("--sif", default=None, help="override singularity image path")
     ap.add_argument("--account", default=LAUNCH["account"])
     ap.add_argument("--partition", default=LAUNCH["partition"])
-    ap.add_argument("--qos", default=LAUNCH["qos"])
+    ap.add_argument("--qos", default=AUTO_QOS,
+                    help=f"srun --qos (default: auto -> 'normal' when >{SAMPLE_QOS_THRESHOLD} "
+                         f"samples, else '{LAUNCH['qos']}')")
     ap.add_argument("--time", default=LAUNCH["time"], help="srun --time (HH:MM:SS)")
     ap.add_argument("--cpus", default=LAUNCH["cpus"])
     ap.add_argument("--mem", default=LAUNCH["mem"])
@@ -366,6 +385,7 @@ def main():
     # config (card_detection in --extra_inputs -> card-detection CSV, else the
     # no_carddet CSV for card-encoder models); an explicit --csv PATH forces one.
     csv_src = None
+    csv_abs = None
     if args.csv is not None:
         if args.csv == AUTO_CSV:
             needs_carddet = "card_detection" in extra
@@ -437,6 +457,21 @@ def main():
         print(f"\n# appended to {tgt}", file=sys.stderr)
 
     if args.launch:
+        # Auto-select QOS by sample count: small debug runs stay on the preemptible
+        # dbg QOS; larger evals go to the non-preemptible `normal` QOS (and get a
+        # longer default wall time so they don't hit the 30-min dbg ceiling).
+        if args.qos == AUTO_QOS:
+            n = count_test_samples(csv_abs, args.workspace or os.getcwd())
+            if n is not None and n > SAMPLE_QOS_THRESHOLD:
+                args.qos = "normal"
+                if args.time == LAUNCH["time"]:
+                    args.time = NORMAL_QOS_TIME
+            else:
+                args.qos = LAUNCH["qos"]
+            print(f"# auto-selected QOS '{args.qos}' "
+                  f"({'unknown' if n is None else n} samples; "
+                  f">{SAMPLE_QOS_THRESHOLD} -> normal @ {NORMAL_QOS_TIME}, "
+                  f"else {LAUNCH['qos']})", file=sys.stderr)
         launch(snippet, run, step, args, tag=save_suffix)
 
 
